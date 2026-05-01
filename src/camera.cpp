@@ -271,42 +271,42 @@ int CameraHandler(void)
 
     // 显示图片
     
-    // if (readFlag(showImg_file)) {
-    //     cv::Mat fbImage(screenHeight, screenWidth, CV_8UC3, cv::Scalar(0, 0, 0));
-    //     // 缩放视频到新尺寸
-    //     cv::resize(binarizedFrame,resizedFrame, cv::Size(newWidth, newHeight));
-    //     //convertMatToRGB565(resizedFrame,fb_buffer,screenWidth,screenHeight);
+    if (readFlag(showImg_file)) {
+        cv::Mat fbImage(screenHeight, screenWidth, CV_8UC3, cv::Scalar(0, 0, 0));
+        // 缩放视频到新尺寸
+        cv::resize(binarizedFrame,resizedFrame, cv::Size(newWidth, newHeight));
+        //convertMatToRGB565(resizedFrame,fb_buffer,screenWidth,screenHeight);
         
-    //     // 将单通道的二值化图像转换为三通道的彩色图像
-    //     cv::Mat coloredResizedFrame;
-    //     cv::cvtColor(resizedFrame, coloredResizedFrame, cv::COLOR_GRAY2BGR); // 转换为彩色图像
+        // 将单通道的二值化图像转换为三通道的彩色图像
+        cv::Mat coloredResizedFrame;
+        cv::cvtColor(resizedFrame, coloredResizedFrame, cv::COLOR_GRAY2BGR); // 转换为彩色图像
 
-    //     // 将缩放后的图像居中放置在帧缓冲区图像中，填充黑色边框
-    //     fbImage.setTo(cv::Scalar(0, 0, 0)); // 清空缓冲区（填充黑色）
-    //     cv::Rect roi((screenWidth - newWidth) / 2, (screenHeight - newHeight) / 2, newWidth, newHeight);
-    //     coloredResizedFrame.copyTo(fbImage(roi));
+        // 将缩放后的图像居中放置在帧缓冲区图像中，填充黑色边框
+        fbImage.setTo(cv::Scalar(0, 0, 0)); // 清空缓冲区（填充黑色）
+        cv::Rect roi((screenWidth - newWidth) / 2, (screenHeight - newHeight) / 2, newWidth, newHeight);
+        coloredResizedFrame.copyTo(fbImage(roi));
 
-    //     // 绘制左右边界线和中线
-    //     int scaledLeftX, scaledRightX, scaledMidX, scaledY;
+        // 绘制左右边界线和中线
+        int scaledLeftX, scaledRightX, scaledMidX, scaledY;
 
-    //     for (int y = 0; y < line_tracking_height; y++) {
-    //         // 根据缩放比例调整X坐标
-    //         scaledLeftX = static_cast<int>(left_line[y] * calc_scale);
-    //         scaledRightX = static_cast<int>(right_line[y] * calc_scale);
-    //         scaledMidX = static_cast<int>(mid_line[y] * calc_scale);
-    //         scaledY = static_cast<int>(y * calc_scale);
+        for (int y = 0; y < line_tracking_height; y++) {
+            // 根据缩放比例调整X坐标
+            scaledLeftX = static_cast<int>(left_line[y] * calc_scale);
+            scaledRightX = static_cast<int>(right_line[y] * calc_scale);
+            scaledMidX = static_cast<int>(mid_line[y] * calc_scale);
+            scaledY = static_cast<int>(y * calc_scale);
 
-    //         // 绘制左边界（红）
-    //         cv::line(fbImage(roi), cv::Point(scaledLeftX, scaledY), cv::Point(scaledLeftX, scaledY), cv::Scalar(0, 0, 255), calc_scale);
-    //         // 绘制右边界（绿）
-    //         cv::line(fbImage(roi), cv::Point(scaledRightX, scaledY), cv::Point(scaledRightX, scaledY), cv::Scalar(0, 255, 0), calc_scale);
-    //         // 绘制中线  （蓝）
-    //         cv::line(fbImage(roi), cv::Point(scaledMidX, scaledY), cv::Point(scaledMidX, scaledY), cv::Scalar(255, 0, 0), calc_scale);
-    //     }
+            // 绘制左边界（红）
+            cv::line(fbImage(roi), cv::Point(scaledLeftX, scaledY), cv::Point(scaledLeftX, scaledY), cv::Scalar(0, 0, 255), calc_scale);
+            // 绘制右边界（绿）
+            cv::line(fbImage(roi), cv::Point(scaledRightX, scaledY), cv::Point(scaledRightX, scaledY), cv::Scalar(0, 255, 0), calc_scale);
+            // 绘制中线  （蓝）
+            cv::line(fbImage(roi), cv::Point(scaledMidX, scaledY), cv::Point(scaledMidX, scaledY), cv::Scalar(255, 0, 0), calc_scale);
+        }
 
-    //     // 将帧缓冲区图像转换为RGB565格式
-    //     convertMatToRGB565(fbImage, fb_buffer, screenWidth, screenHeight);
-    // }
+        // 将帧缓冲区图像转换为RGB565格式
+        convertMatToRGB565(fbImage, fb_buffer, screenWidth, screenHeight);
+    }
 
 
     return 0;
