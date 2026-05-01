@@ -14,7 +14,7 @@
 double target_speed;
 int servo_mid;
 std::atomic<bool> pause_flag(false);  
-PwmController servo(2, 0);
+PwmController servo(1, 0);
 PIDController ServoControl(1.0, 0.0, 2.0, 0.0, POSITION, 1300000);
 double servo_error_temp = 0.0;
 

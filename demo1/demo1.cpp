@@ -18,7 +18,7 @@
 
 GPIO mortorEN(73);
 MotorController* motorController[2] = { nullptr, nullptr };
-PwmController servo(2, 0);
+PwmController servo(1, 0);
 
 void Init()
 {
@@ -79,16 +79,16 @@ int main()
         // 添加按下的键到集合中，并响应按下的键
         if (ch == 'w' || ch == 'W') {
             pressedKeys.insert('W');
-            motorController[0]->updateduty(10);
-            motorController[1]->updateduty(10);
+            motorController[0]->updateduty(30);
+            motorController[1]->updateduty(30);
             servo.setDutyCycle(1520000);
         } else if (ch == 'a' || ch == 'A') {
             pressedKeys.insert('A');
             servo.setDutyCycle(1360000);
         } else if (ch == 's' || ch == 'S') {
             pressedKeys.insert('S');
-            motorController[0]->updateduty(-10);
-            motorController[1]->updateduty(-10);
+            motorController[0]->updateduty(-30);
+            motorController[1]->updateduty(-30);
             servo.setDutyCycle(1520000);
         } else if (ch == 'd' || ch == 'D') {
             pressedKeys.insert('D');
