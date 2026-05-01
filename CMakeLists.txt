@@ -46,7 +46,8 @@ target_sources(common_lib PRIVATE ${COMMON_SOURCES})
 
 # 添加所有子目录
 set(SUBDIRS
-    main   
+    main  
+    demo1
 )
 
 foreach(subdir ${SUBDIRS})
