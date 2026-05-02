@@ -4,18 +4,21 @@
  * @LastEditors: ilikara 3435193369@qq.com
  * @LastEditTime: 2025-04-12 11:35:16
  * @FilePath: /smartcar/src/camera.cpp
- * @Description: Camera capture, vision control and framebuffer display
+ * @Description: Camera capture, vision control, element recognition and framebuffer display
  */
+
 #include "camera.h"
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <iomanip>
 #include <iostream>
 #include <limits>
 #include <mutex>
 #include <sstream>
 #include <thread>
+#include <vector>
 
 #include "PIDController.h"
 #include "PwmController.h"
@@ -45,6 +48,399 @@ bool range_mark = 0;
 
 #define calc_scale 2
 
+/*
+ * 元素识别参数
+ *
+ * 说明：
+ * 1. 这里只做检测和打印，不控制停车、不控制语音、不修改速度。
+ * 2. 如果误检较多，可以适当调高 WHITE_GRAY_THRESHOLD 或 WHITE_RATIO_THRESHOLD。
+ * 3. 如果斑马线检测不灵敏，可以适当降低 ZEBRA_MIN_STRIPES 或 ZEBRA_TRANSITION_THRESHOLD。
+ */
+static constexpr int WHITE_GRAY_THRESHOLD = 165;
+static constexpr int ZEBRA_TRANSITION_THRESHOLD = 10;
+static constexpr int ZEBRA_MIN_STRIPES = 3;
+static constexpr double ELEMENT_PRINT_COOLDOWN_SEC = 1.5;
+
+/*
+ * 获取当前时间字符串，用于打印日志。
+ */
+static std::string getTimeString()
+{
+    auto now = std::chrono::system_clock::now();
+    auto in_time_t = std::chrono::system_clock::to_time_t(now);
+
+    std::stringstream ss;
+    ss << std::put_time(std::localtime(&in_time_t), "%Y-%m-%d %X");
+    return ss.str();
+}
+
+/*
+ * 获取白色区域掩膜。
+ *
+ * 同时使用 HSV 白色阈值和灰度阈值：
+ * - HSV 用来筛出低饱和、高亮度区域；
+ * - 灰度阈值用来适配你们赛道上白线与背景灰度差异不大的情况。
+ */
+static cv::Mat getWhiteMask(const cv::Mat& inputImage)
+{
+    cv::Mat hsvImage;
+    cv::cvtColor(inputImage, hsvImage, cv::COLOR_BGR2HSV);
+
+    cv::Mat hsvWhiteMask;
+    cv::inRange(
+        hsvImage,
+        cv::Scalar(0, 0, 150),
+        cv::Scalar(180, 80, 255),
+        hsvWhiteMask
+    );
+
+    cv::Mat grayImage;
+    cv::cvtColor(inputImage, grayImage, cv::COLOR_BGR2GRAY);
+
+    cv::Mat grayWhiteMask;
+    cv::threshold(
+        grayImage,
+        grayWhiteMask,
+        WHITE_GRAY_THRESHOLD,
+        255,
+        cv::THRESH_BINARY
+    );
+
+    cv::Mat whiteMask;
+    cv::bitwise_and(hsvWhiteMask, grayWhiteMask, whiteMask);
+
+    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(5, 3));
+    cv::morphologyEx(whiteMask, whiteMask, cv::MORPH_OPEN, kernel);
+    cv::morphologyEx(whiteMask, whiteMask, cv::MORPH_CLOSE, kernel);
+
+    return whiteMask;
+}
+
+/*
+ * 斑马线检测方法一：检测多个横向白色长条。
+ *
+ * 斑马线通常表现为多个近似水平的白色条纹，
+ * 所以找白色掩膜中的横向长条轮廓。
+ */
+static bool detectZebraByStripes(const cv::Mat& inputImage)
+{
+    if (inputImage.empty()) {
+        return false;
+    }
+
+    const int height = inputImage.rows;
+    const int width = inputImage.cols;
+
+    // 只看图像中下部，减少远处背景干扰
+    int roiY = static_cast<int>(height * 0.35);
+    int roiH = static_cast<int>(height * 0.60);
+
+    if (roiY < 0) {
+        roiY = 0;
+    }
+    if (roiY + roiH > height) {
+        roiH = height - roiY;
+    }
+    if (roiH <= 0) {
+        return false;
+    }
+
+    cv::Rect roi(0, roiY, width, roiH);
+    cv::Mat roiImage = inputImage(roi);
+
+    cv::Mat whiteMask = getWhiteMask(roiImage);
+
+    // 横向闭运算，增强横向条纹
+    cv::Mat horizontalKernel =
+        cv::getStructuringElement(cv::MORPH_RECT, cv::Size(15, 1));
+    cv::morphologyEx(whiteMask, whiteMask, cv::MORPH_CLOSE, horizontalKernel);
+
+    std::vector<std::vector<cv::Point>> contours;
+    cv::findContours(
+        whiteMask,
+        contours,
+        cv::RETR_EXTERNAL,
+        cv::CHAIN_APPROX_SIMPLE
+    );
+
+    std::vector<cv::Rect> stripeRects;
+
+    for (const auto& contour : contours) {
+        double area = cv::contourArea(contour);
+        if (area < 30) {
+            continue;
+        }
+
+        cv::Rect rect = cv::boundingRect(contour);
+
+        if (rect.height <= 0) {
+            continue;
+        }
+
+        double aspectRatio = static_cast<double>(rect.width) / rect.height;
+
+        bool isHorizontalStripe =
+            rect.width > width * 0.25 &&
+            aspectRatio > 2.5 &&
+            rect.height >= 2 &&
+            rect.height <= roiH * 0.30;
+
+        if (isHorizontalStripe) {
+            stripeRects.push_back(rect);
+        }
+    }
+
+    if (static_cast<int>(stripeRects.size()) < ZEBRA_MIN_STRIPES) {
+        return false;
+    }
+
+    std::sort(
+        stripeRects.begin(),
+        stripeRects.end(),
+        [](const cv::Rect& a, const cv::Rect& b) {
+            return a.y < b.y;
+        }
+    );
+
+    // 检查条纹之间的间距是否大致合理
+    std::vector<int> gaps;
+    for (size_t i = 1; i < stripeRects.size(); ++i) {
+        int gap = stripeRects[i].y - stripeRects[i - 1].y;
+        if (gap > 0) {
+            gaps.push_back(gap);
+        }
+    }
+
+    if (gaps.empty()) {
+        return true;
+    }
+
+    double avgGap = 0.0;
+    for (int gap : gaps) {
+        avgGap += gap;
+    }
+    avgGap /= gaps.size();
+
+    if (avgGap <= 1.0) {
+        return true;
+    }
+
+    int validGapCount = 0;
+    for (int gap : gaps) {
+        if (std::abs(gap - avgGap) <= avgGap * 0.8) {
+            validGapCount++;
+        }
+    }
+
+    return validGapCount >= static_cast<int>(gaps.size()) / 2;
+}
+
+/*
+ * 斑马线检测方法二：参考 smartcar_star 中的灰度跳变思想。
+ *
+ * 沿着几条水平扫描线统计黑白变化次数。
+ * 斑马线区域的黑白交替会造成较多跳变。
+ */
+static bool detectZebraByTransitions(const cv::Mat& inputImage)
+{
+    if (inputImage.empty()) {
+        return false;
+    }
+
+    cv::Mat gray;
+    cv::cvtColor(inputImage, gray, cv::COLOR_BGR2GRAY);
+
+    const int height = gray.rows;
+    const int width = gray.cols;
+
+    const int xStart = static_cast<int>(width * 0.10);
+    const int xEnd = static_cast<int>(width * 0.90);
+
+    if (xEnd <= xStart) {
+        return false;
+    }
+
+    const int scanLines = 5;
+    const int baseY = static_cast<int>(height * 0.55);
+
+    int totalTransitions = 0;
+    int validScanLines = 0;
+
+    for (int i = 0; i < scanLines; ++i) {
+        int y = baseY + (i - scanLines / 2) * 6;
+
+        if (y < 0 || y >= height) {
+            continue;
+        }
+
+        bool currentWhite = gray.at<uchar>(y, xStart) > WHITE_GRAY_THRESHOLD;
+        int lineTransitions = 0;
+
+        for (int x = xStart; x < xEnd; x += 3) {
+            bool pixelWhite = gray.at<uchar>(y, x) > WHITE_GRAY_THRESHOLD;
+
+            if (pixelWhite != currentWhite) {
+                lineTransitions++;
+                currentWhite = pixelWhite;
+            }
+        }
+
+        totalTransitions += lineTransitions;
+        validScanLines++;
+    }
+
+    if (validScanLines == 0) {
+        return false;
+    }
+
+    int avgTransitions = totalTransitions / validScanLines;
+
+    return avgTransitions >= ZEBRA_TRANSITION_THRESHOLD;
+}
+
+/*
+ * 斑马线检测总入口。
+ */
+static bool detectZebraCrossing(const cv::Mat& inputImage)
+{
+    return detectZebraByStripes(inputImage) || detectZebraByTransitions(inputImage);
+}
+
+/*
+ * 白线检测。
+ *
+ * 目标：检测一条比较连续、横向跨度较大的白色线。
+ * 为了避免斑马线误判为白线，调用方会优先判断斑马线。
+ */
+static bool detectWhiteLine(const cv::Mat& inputImage)
+{
+    if (inputImage.empty()) {
+        return false;
+    }
+
+    const int height = inputImage.rows;
+    const int width = inputImage.cols;
+
+    // 白线一般在车前方偏下区域出现，这里只检测中下部
+    int roiY = static_cast<int>(height * 0.45);
+    int roiH = static_cast<int>(height * 0.45);
+
+    if (roiY < 0) {
+        roiY = 0;
+    }
+    if (roiY + roiH > height) {
+        roiH = height - roiY;
+    }
+    if (roiH <= 0) {
+        return false;
+    }
+
+    cv::Rect roi(0, roiY, width, roiH);
+    cv::Mat roiImage = inputImage(roi);
+
+    cv::Mat whiteMask = getWhiteMask(roiImage);
+
+    // 增强横向连续白线
+    cv::Mat horizontalKernel =
+        cv::getStructuringElement(cv::MORPH_RECT, cv::Size(25, 3));
+    cv::morphologyEx(whiteMask, whiteMask, cv::MORPH_CLOSE, horizontalKernel);
+
+    std::vector<std::vector<cv::Point>> contours;
+    cv::findContours(
+        whiteMask,
+        contours,
+        cv::RETR_EXTERNAL,
+        cv::CHAIN_APPROX_SIMPLE
+    );
+
+    int wideStripeCount = 0;
+
+    for (const auto& contour : contours) {
+        double area = cv::contourArea(contour);
+
+        if (area < width * 2.0) {
+            continue;
+        }
+
+        cv::Rect rect = cv::boundingRect(contour);
+
+        if (rect.height <= 0) {
+            continue;
+        }
+
+        double aspectRatio = static_cast<double>(rect.width) / rect.height;
+
+        bool isWhiteLine =
+            rect.width > width * 0.35 &&
+            rect.height >= 2 &&
+            rect.height <= roiH * 0.35 &&
+            aspectRatio > 2.0;
+
+        if (isWhiteLine) {
+            wideStripeCount++;
+        }
+    }
+
+    /*
+     * 单条白线一般只有 1~2 个横向白色大区域；
+     * 如果宽条太多，很可能是斑马线。
+     */
+    return wideStripeCount >= 1 && wideStripeCount < ZEBRA_MIN_STRIPES;
+}
+
+/*
+ * 元素识别打印逻辑。
+ *
+ * 只打印，不控制小车。
+ * 使用上升沿 + 冷却时间，避免每一帧都刷屏。
+ */
+static void ElementDetectAndPrint(const cv::Mat& frame)
+{
+    if (frame.empty()) {
+        return;
+    }
+
+    static bool lastZebraDetected = false;
+    static bool lastWhiteLineDetected = false;
+
+    static double lastZebraPrintTime = -100.0;
+    static double lastWhitePrintTime = -100.0;
+
+    double now = static_cast<double>(cv::getTickCount()) / cv::getTickFrequency();
+
+    bool zebraDetected = detectZebraCrossing(frame);
+
+    /*
+     * 斑马线优先级高于白线。
+     * 如果当前已经判定为斑马线，就不再打印白线，避免斑马线中的单条白色条纹被误报为白线。
+     */
+    bool whiteLineDetected = false;
+    if (!zebraDetected) {
+        whiteLineDetected = detectWhiteLine(frame);
+    }
+
+    bool zebraRisingEdge = zebraDetected && !lastZebraDetected;
+    bool whiteRisingEdge = whiteLineDetected && !lastWhiteLineDetected;
+
+    if (zebraDetected &&
+        zebraRisingEdge &&
+        now - lastZebraPrintTime >= ELEMENT_PRINT_COOLDOWN_SEC)
+    {
+        std::cout << "[" << getTimeString() << "] [元素识别] 检测到斑马线" << std::endl;
+        lastZebraPrintTime = now;
+    }
+
+    if (whiteLineDetected &&
+        whiteRisingEdge &&
+        now - lastWhitePrintTime >= ELEMENT_PRINT_COOLDOWN_SEC)
+    {
+        std::cout << "[" << getTimeString() << "] [元素识别] 检测到白线" << std::endl;
+        lastWhitePrintTime = now;
+    }
+
+    lastZebraDetected = zebraDetected;
+    lastWhiteLineDetected = whiteLineDetected;
+}
 
 int CameraInit(uint8_t camera_id, double dest_fps, int width, int height)
 {
@@ -138,7 +534,6 @@ int CameraInit(uint8_t camera_id, double dest_fps, int width, int height)
     return static_cast<int>(1000.0 / std::min(fps, dest_fps));
 }
 
-
 void cameraDeInit(void)
 {
     cap.release();
@@ -157,7 +552,6 @@ void cameraDeInit(void)
 
     close(fb);
 }
-
 
 int saved_frame_count = 0;
 
@@ -183,7 +577,6 @@ bool saveCameraImage(cv::Mat frame, const std::string& directory)
     // 保存图像
     return cv::imwrite(filename.str(), frame);
 }
-
 
 std::mutex frameMutex;
 cv::Mat pubframe;
@@ -222,7 +615,6 @@ void streamCapture(void)
     }
 }
 
-
 int CameraHandler(void)
 {
     static int frame_count = 0;
@@ -257,6 +649,11 @@ int CameraHandler(void)
     camera_ready = true;
     empty_frame_count = 0;
 
+    /*
+     * 元素识别：
+     * 这里只检测并打印，不停车、不改速度、不影响闭环控制。
+     */
+    ElementDetectAndPrint(raw_frame);
 
     // 图像计算
     {
@@ -270,7 +667,6 @@ int CameraHandler(void)
             cross_mark = 0;
         }
     }
-
 
     // 视觉控制部分
     if (readFlag(start_file)) {
@@ -307,7 +703,6 @@ int CameraHandler(void)
         }
     }
 
-
     // 保存图像
     if (readFlag(saveImg_file)) {
         if (saveCameraImage(raw_frame, "./image")) {
@@ -317,7 +712,6 @@ int CameraHandler(void)
             return -1;
         }
     }
-
 
     // 显示图像：二值化赛道图 + 左边界 + 右边界 + 中线
     if (readFlag(showImg_file)) {
@@ -417,7 +811,6 @@ int CameraHandler(void)
         // 写入 framebuffer
         convertMatToRGB565(fbImage, fb_buffer, screenWidth, screenHeight);
     }
-
 
     // 结束计时并计算
     auto end_time = std::chrono::high_resolution_clock::now();
