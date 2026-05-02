@@ -1,5 +1,7 @@
 #include "Timer.h"
 
+#include <chrono>
+
 Timer::Timer(int interval_ms, std::function<void()> task)
     : interval(interval_ms)
     , task(task)
@@ -9,7 +11,7 @@ Timer::Timer(int interval_ms, std::function<void()> task)
 
 Timer::~Timer()
 {
-    stop(); // Ensure the timer is stopped in the destructor
+    stop();
 }
 
 void Timer::start()
@@ -28,11 +30,17 @@ void Timer::stop()
 
 void Timer::run()
 {
+    using clock = std::chrono::steady_clock;
+
+    auto next_time = clock::now();
+
     while (running) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(interval));
-        if ((trigger1_fired&& trigger_count==0)||(trigger4_fired&& trigger_count==3)) ;
+        next_time += std::chrono::milliseconds(interval);
+
         if (running) {
-            std::thread(task).detach();
+            task();
         }
+
+        std::this_thread::sleep_until(next_time);
     }
 }
