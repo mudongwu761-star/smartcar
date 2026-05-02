@@ -49,8 +49,9 @@ int main(void)
         //SignClassifyTimer.start();
         std::cout << "Classify Service started!\n";
         // 主循环，直到用户输入 Ctrl+C
-        distanceMeasureInit();
-        std::cout << "Distance Measurement started!\n";
+        // Disable distance-triggered actions for normal manual/vision testing.
+        // distanceMeasureInit() starts the thread that sets trigger*_fired flags.
+        std::cout << "Distance trigger service disabled.\n";
         while (running.load()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
             target_speed = readDoubleFromFile(speed_file);
@@ -66,15 +67,7 @@ int main(void)
             ki = readDoubleFromFile(ki_file);
             kd = readDoubleFromFile(kd_file);
             // vofa_image(1, 160*120, 160, 120, Format_Grayscale8, (char*)IMG);
-            if ((trigger1_fired&&(trigger_count==0))|| (trigger4_fired&&(trigger_count==3)))
-            {
-                  ControlPause();
-            }
-            if(trigger7_fired && trigger_count==6) 
-            {
-                ControlPause();
-                running.store(false);
-            }
+            // Distance-triggered pauses/end-stop are disabled.
         }
         std::cout << "Stopping!\n";
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
@@ -96,8 +89,12 @@ int main(void)
         cameraDeInit();
         std::cout << "Camera Service stopped!\n";
 
-        distanceMeasureStop();
-        std::cout << "Distance Service stopped!\n";
+        std::cout << "Distance Service was not started.\n";
     }
     return 0;
 }
+
+
+//P 0.2
+//I 0
+//D 0.15
