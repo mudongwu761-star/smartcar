@@ -4,17 +4,16 @@
  * @LastEditors: ilikara 3435193369@qq.com
  * @LastEditTime: 2025-04-05 09:02:37
  * @FilePath: /smartcar/src/control.cpp
- * @Description:
- *
- * Copyright (c) 2024 by ${git_name_email}, All Rights Reserved.
+ * @Description: 闭环视觉循迹控制：中线误差 -> 舵机PID -> 差速 -> 电机PID
  */
+
 #include "control.h"
 
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <iostream>
 #include <thread>
-
-#include <algorithm>
 
 #include "GPIO.h"
 #include "MotorController.h"
@@ -22,26 +21,25 @@
 #include "PwmController.h"
 #include "global.h"
 
-// 在文件顶部声明全局对象
+// 电机使能 GPIO
 GPIO mortorEN(73);
-MotorController* leftMotor = nullptr;  // 使用指针
-MotorController1* rightMotor = nullptr; // 使用指针
+
+// 左右电机控制器
+MotorController* leftMotor = nullptr;
+MotorController1* rightMotor = nullptr;
+
+// 电机 PID 参数，由 main.cpp 周期性读取参数文件后更新
 double mortor_kp = 0;
 double mortor_ki = 0;
 double mortor_kd = 0;
-bool motorsInitialized = false;
-int STOP_DURATION = 0;
 
-// 在文件开始处添加计数器
-static int turn_right_counter = 0;
-static int turn_left_counter = 0;
-  // 0.3s / 0.008s ≈ 37.5，取38
+bool motorsInitialized = false;
 
 void ControlInit()
 {
     mortorEN.setDirection("out");
     mortorEN.setValue(1);
-    
+
     // 左轮参数
     const int left_pwmchip = 8;
     const int left_pwmnum = 2;
@@ -49,7 +47,7 @@ void ControlInit()
     const int left_encoder_pwmchip = 3;
     const int left_encoder_gpioNum = 72;
     const int left_encoder_dir = -1;
-    
+
     // 右轮参数
     const int right_pwmchip = 8;
     const int right_pwmnum = 1;
@@ -57,121 +55,133 @@ void ControlInit()
     const int right_encoder_pwmchip = 0;
     const int right_encoder_gpioNum = 75;
     const int right_encoder_dir = 1;
-    
+
     const unsigned int period_ns = 50000; // 20 kHz
 
-    // 动态分配内存
-    leftMotor = new MotorController(left_pwmchip, left_pwmnum, left_gpioNum, period_ns,
-        mortor_kp, mortor_ki, mortor_kd, 0,
-        left_encoder_pwmchip, left_encoder_gpioNum, left_encoder_dir);
-    
-    rightMotor = new MotorController1(right_pwmchip, right_pwmnum, right_gpioNum, period_ns,
-        mortor_kp, mortor_ki, mortor_kd, 0,
-        right_encoder_pwmchip, right_encoder_gpioNum, right_encoder_dir);
-        
+    leftMotor = new MotorController(
+        left_pwmchip,
+        left_pwmnum,
+        left_gpioNum,
+        period_ns,
+        mortor_kp,
+        mortor_ki,
+        mortor_kd,
+        0,
+        left_encoder_pwmchip,
+        left_encoder_gpioNum,
+        left_encoder_dir
+    );
+
+    rightMotor = new MotorController1(
+        right_pwmchip,
+        right_pwmnum,
+        right_gpioNum,
+        period_ns,
+        mortor_kp,
+        mortor_ki,
+        mortor_kd,
+        0,
+        right_encoder_pwmchip,
+        right_encoder_gpioNum,
+        right_encoder_dir
+    );
+
     motorsInitialized = true;
 }
 
 void ControlPause()
 {
-    servo.setDutyCycle(1530000);
-    leftMotor->updateduty(0);
-    rightMotor->updateduty1(0);
-    std::cout << "mortors have paused\n";
+    servo.setDutyCycle(servo_mid);
+
+    if (motorsInitialized) {
+        leftMotor->updateduty(0);
+        rightMotor->updateduty1(0);
+    }
+
+    mortorEN.setValue(0);
+    std::cout << "motors have paused\n";
 }
 
 void ControlMain()
 {
-    if (readFlag(start_file)) 
-    {
-        // 添加舵机控制
-        if ((trigger2_fired&&(trigger_count==1))|| (trigger5_fired&&(trigger_count==4))) {
-            // 右转持续0.3秒
-            if (turn_right_counter < TURN_DURATION) {
-                //std::cout << "motorchanged\n";
-                //std::cout << turn_right_counter<<std::endl;
-                //servo.setDutyCycle(servo_mid + 100000);
-                turn_right_counter++;
-            } else {
-                trigger_count++;
-                turn_right_counter = 0;  // 重置计数器
-            }
-        }
-        else if ((trigger3_fired&&(trigger_count==2))|| (trigger6_fired&&(trigger_count==5))) {
-            // 左转持续0.3秒
-            if (turn_left_counter < TURN_DURATION) {
-                //std::cout << "motorchanged\n";
-                //std::cout << turn_left_counter<<std::endl;
-                servo.setDutyCycle(servo_mid - 250000);
-                turn_left_counter++;
-            } else {
-                trigger_count++;
-                turn_left_counter = 0;  // 重置计数器
-            }
-        }
-        else {
-            // 重置计数器
-            turn_right_counter = 0;
-            turn_left_counter = 0;
-            
-            // 正常视觉控制
-            double servoduty = -ServoControl.update(servo_error_temp);
-            servoduty = std::clamp(servoduty, -8.0, 8.0);
-            double servoduty_ns = (servoduty) / 100 * servo.readPeriod() + servo_mid;
-            servo.setDutyCycle(servoduty_ns);
-        }
-
-        double judge = (servo.readDutyCycle() - 1530000.0)/1000.0;
-        double left_speed=0.0;
-        double right_speed=0.0;
-        
-        // 使用可调节的差速系数
-        double s = abs(judge) * speed_diff_k; 
-        s = std::min(s, 1.0); // 限制最大差速为100%
-
-        if (judge > 1000000) {
-            left_speed = target_speed;
-            right_speed = target_speed * (1 - s);
-        } else if (judge < -1000000) {
-            left_speed = target_speed * (1 - s);
-            right_speed = target_speed;
-        }
-        else {
-            left_speed = target_speed;
-            right_speed = target_speed;
-        }
-
-        if((trigger1_fired&& trigger_count==0)||(trigger4_fired&& trigger_count==3)||(trigger7_fired && trigger_count==6)){
-            left_speed = 0.0;
-            right_speed = 0.0;
-            STOP_DURATION++;
-            //std::cout<<STOP_DURATION;
-            if(STOP_DURATION > 350)
-            {
-                STOP_DURATION = 0;
-                trigger_count += 1;
-            }
-        }
-
-        leftMotor->pidController.setPID(mortor_kp, mortor_ki, mortor_kd);
-        leftMotor->updateTarget(left_speed);
-        leftMotor->updateSpeed();
-        
-        rightMotor->pidController1.setPID(mortor_kp, mortor_ki, mortor_kd);
-        rightMotor->updateTarget1(right_speed);
-        rightMotor->updateSpeed1();
-       
-        // leftMotor->updateduty(target_speed);
-        // rightMotor->updateduty1(target_speed);
-
-        mortorEN.setValue(1);
-    } else {
+    if (!readFlag(start_file)) {
         if (motorsInitialized) {
             leftMotor->updateduty(0);
             rightMotor->updateduty1(0);
         }
+
         mortorEN.setValue(0);
+        return;
     }
+
+    if (!motorsInitialized) {
+        return;
+    }
+
+    mortorEN.setValue(1);
+
+    /*
+     * 一、舵机闭环控制
+     *
+     * servo_error_temp 来自视觉处理：
+     * 当前识别到的赛道中线位置 - 图像中心位置
+     *
+     * ServoControl.update() 根据中线误差输出舵机修正量。
+     * 这里不再做 trigger 特殊转向，始终按照中线 PID 控制。
+     */
+    double servo_percent = -ServoControl.update(servo_error_temp);
+
+    // 舵机输出限幅。单位可以理解为占舵机周期百分比。
+    servo_percent = std::clamp(servo_percent, -8.0, 8.0);
+
+    const double servo_period = static_cast<double>(servo.readPeriod());
+    const double servo_duty_ns = servo_mid + servo_percent / 100.0 * servo_period;
+
+    servo.setDutyCycle(static_cast<unsigned int>(servo_duty_ns));
+
+    /*
+     * 二、根据舵机转向幅度做左右轮差速
+     *
+     * servo_percent > 0：舵机向一个方向转
+     * servo_percent < 0：舵机向另一个方向转
+     *
+     * 具体正负对应左转还是右转，要看你们舵机安装方向。
+     * 如果发现过弯时差速方向反了，只需要交换下面两个分支里的左右轮速度即可。
+     */
+    double left_speed = target_speed;
+    double right_speed = target_speed;
+
+    double diff_ratio = std::abs(servo_percent) * speed_diff_k;
+
+    // 限制最大差速，避免内侧轮速度被压得过低
+    diff_ratio = std::clamp(diff_ratio, 0.0, 0.7);
+
+    if (servo_percent > 0.2) {
+        // 分支 A：当前认为右轮为内侧轮
+        left_speed = target_speed;
+        right_speed = target_speed * (1.0 - diff_ratio);
+    } else if (servo_percent < -0.2) {
+        // 分支 B：当前认为左轮为内侧轮
+        left_speed = target_speed * (1.0 - diff_ratio);
+        right_speed = target_speed;
+    } else {
+        // 小误差直行
+        left_speed = target_speed;
+        right_speed = target_speed;
+    }
+
+    /*
+     * 三、电机速度闭环控制
+     *
+     * 左右轮分别根据编码器反馈做 PID。
+     */
+    leftMotor->pidController.setPID(mortor_kp, mortor_ki, mortor_kd);
+    leftMotor->updateTarget(left_speed);
+    leftMotor->updateSpeed();
+
+    rightMotor->pidController1.setPID(mortor_kp, mortor_ki, mortor_kd);
+    rightMotor->updateTarget1(right_speed);
+    rightMotor->updateSpeed1();
 }
 
 void ControlExit()
@@ -181,69 +191,9 @@ void ControlExit()
         rightMotor->updateduty1(0);
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
-    
+
     mortorEN.setValue(0);
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    
-    // // 释放内存
-    // if (leftMotor) {
-    //     delete leftMotor;
-    //     leftMotor = nullptr;
-    // }
-    
-    // if (rightMotor) {
-    //     delete rightMotor;
-    //     rightMotor = nullptr;
-    // }
-    
+
     std::cout << "电机已完全停止" << std::endl;
 }
-
-
-//1            -0.0795
-//2           -0.0455
-//3            -0.0955
-//4            -0.0285
-//5           -0.0285
-//6            0.0
-//7            0.001
-//8            0.0345
-//9            0.0
-//10           0.324
-//11           1.7345
-//12           3.1785
-//13           4.589
-//14           6.5335
-//15           7.9475
-//16           9.4295
-//17           10.181
-//18           11.505
-//19           11.561
-//20           13.6405
-//21           14.7265
-//22           15.504
-//23           16.563
-//24           16.933
-//25           17.7895
-//26           18.944
-//27           19.9305
-//28           20.207
-//29           21.1075
-//30           21.2815
-//31           21.834
-//32           23.6885
-//33           24.206
-//34           24.2605
-//35           25.673
-//36           25.8975
-//37           26.9065
-//38           27.6415
-//39           28.681
-//40           27.614
-//41           29.4575
-//42           28.105
-//43           30.932
-//44           30.9015
-//45           30.8295
-//46           30.917
-//47           32.7185
