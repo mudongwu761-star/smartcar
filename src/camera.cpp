@@ -48,6 +48,7 @@ bool range_mark = 0;
 
 #define calc_scale 2
 
+
 /*
  * =========================
  * 轻量级元素识别参数
@@ -58,14 +59,36 @@ bool range_mark = 0;
  * 2. 只打印识别结果；
  * 3. 不停车、不改速度、不发语音。
  *
- * 调参建议：
- * - 白线/斑马线检测不到：适当降低 ELEMENT_WHITE_THRESHOLD，例如 165 -> 155。
- * - 误检较多：适当提高 ELEMENT_WHITE_THRESHOLD，例如 165 -> 180。
- * - 仍然影响寻迹：把 ELEMENT_DETECT_INTERVAL 改大，例如 6 -> 10。
+ * 本版修改重点：
+ * - 根据现场数据，普通白线 max ratio 接近 1.00，斑马线 max ratio 接近 0.75；
+ * - 收窄斑马线的 partial-ratio 上限，减少普通亮斑/边缘误检；
+ * - 增加斑马线连续确认帧数，过滤偶发误检点；
+ * - 斑马线候选出现时，暂时不报白线，避免同一目标被重复分类。
  */
-static constexpr int ELEMENT_WHITE_THRESHOLD = 165;
-static constexpr int ELEMENT_DETECT_INTERVAL = 6;
+static constexpr int ELEMENT_WHITE_THRESHOLD = 180;
+static constexpr int ELEMENT_DETECT_INTERVAL = 3;
 static constexpr double ELEMENT_PRINT_COOLDOWN_SEC = 1.5;
+static constexpr bool ELEMENT_DEBUG_PRINT = true;
+
+/*
+ * 根据你的实测数据：
+ * 白线：   wMaxRatio ≈ 1.00
+ * 斑马线： wMaxRatio ≈ 0.75
+ */
+static constexpr double WHITE_LINE_MIN_RATIO = 0.90;
+static constexpr double ZEBRA_PARTIAL_MIN_RATIO = 0.50;
+static constexpr double ZEBRA_PARTIAL_MAX_RATIO = 0.88;   // 斑马线检测不稳定时先放宽上限；若误检增多再降到 0.84/0.82
+static constexpr double ZEBRA_MIN_TRANSITIONS = 1.80;
+static constexpr int ZEBRA_MIN_BAND_HEIGHT = 8;
+static constexpr int ZEBRA_CONFIRM_FRAMES = 2;            // 保持 2 帧确认；通过提高检测频率来提升稳定性
+
+struct ElementDebugInfo {
+    double max_white_ratio = 0.0;
+    double avg_transitions = 0.0;
+    int stripe_count = 0;
+    int band_count = 0;
+    int max_band_height = 0;
+};
 
 /*
  * 统计某一行中的白色像素比例。
@@ -100,8 +123,6 @@ static double whiteRatioOnRow(const cv::Mat& gray, int y, int x_start, int x_end
 
 /*
  * 统计某一列上的黑白跳变次数。
- *
- * 斑马线通常会在纵向方向出现多次白/黑/白/黑变化。
  */
 static int transitionCountOnColumn(const cv::Mat& gray, int x, int y_start, int y_end, int step)
 {
@@ -129,14 +150,12 @@ static int transitionCountOnColumn(const cv::Mat& gray, int x, int y_start, int 
 }
 
 /*
- * 检测斑马线。
+ * 检测斑马线候选。
  *
- * 方法：
- * 1. 只检测图像中下部 ROI，减少远处背景干扰；
- * 2. 沿纵向统计白/黑跳变；
- * 3. 再统计横向白色条带数量。
+ * 注意：这里返回的是 candidate，不是最终输出结果。
+ * 最终输出还要在 ElementDetectAndPrintLowRate() 里做连续帧确认。
  */
-static bool detectZebraCrossingLightweight(const cv::Mat& gray)
+static bool detectZebraCrossingLightweight(const cv::Mat& gray, ElementDebugInfo* debug_info = nullptr)
 {
     if (gray.empty()) {
         return false;
@@ -149,23 +168,19 @@ static bool detectZebraCrossingLightweight(const cv::Mat& gray)
     const int x_end = static_cast<int>(width * 0.88);
 
     const int y_start = static_cast<int>(height * 0.35);
-    const int y_end = static_cast<int>(height * 0.85);
+    const int y_end = static_cast<int>(height * 0.90);
 
     if (x_end <= x_start || y_end <= y_start) {
         return false;
     }
 
-    /*
-     * 方法一：纵向跳变检测。
-     */
     int total_transitions = 0;
     int valid_columns = 0;
 
-    const int column_count = 7;
+    const int column_count = 9;
 
     for (int i = 0; i < column_count; ++i) {
         int x = x_start + (x_end - x_start) * i / std::max(1, column_count - 1);
-
         int transitions = transitionCountOnColumn(gray, x, y_start, y_end, 3);
 
         total_transitions += transitions;
@@ -177,17 +192,17 @@ static bool detectZebraCrossingLightweight(const cv::Mat& gray)
         avg_transitions = static_cast<double>(total_transitions) / static_cast<double>(valid_columns);
     }
 
-    /*
-     * 方法二：横向白色条带计数。
-     */
     int stripe_count = 0;
     bool in_stripe = false;
     int stripe_height = 0;
+    int max_stripe_height = 0;
+    double max_white_ratio = 0.0;
 
     for (int y = y_start; y < y_end; y += 2) {
         double ratio = whiteRatioOnRow(gray, y, x_start, x_end, 2);
+        max_white_ratio = std::max(max_white_ratio, ratio);
 
-        bool row_is_white_band = ratio > 0.42;
+        bool row_is_white_band = ratio > 0.28;
 
         if (row_is_white_band) {
             if (!in_stripe) {
@@ -200,6 +215,7 @@ static bool detectZebraCrossingLightweight(const cv::Mat& gray)
             if (in_stripe) {
                 if (stripe_height >= 1) {
                     stripe_count++;
+                    max_stripe_height = std::max(max_stripe_height, stripe_height);
                 }
 
                 in_stripe = false;
@@ -210,18 +226,39 @@ static bool detectZebraCrossingLightweight(const cv::Mat& gray)
 
     if (in_stripe && stripe_height >= 1) {
         stripe_count++;
+        max_stripe_height = std::max(max_stripe_height, stripe_height);
+    }
+
+    if (debug_info != nullptr) {
+        debug_info->avg_transitions = avg_transitions;
+        debug_info->stripe_count = stripe_count;
+        debug_info->max_white_ratio = max_white_ratio;
+        debug_info->max_band_height = max_stripe_height;
     }
 
     /*
-     * 斑马线判据：
-     * - 平均纵向跳变较多；
-     * - 或者横向白色条带数量达到 3 条以上。
+     * 判据一：典型斑马线，多条横向白带。
      */
-    if (avg_transitions >= 5.0) {
+    if (stripe_count >= 2 &&
+        max_white_ratio >= ZEBRA_PARTIAL_MIN_RATIO &&
+        max_white_ratio <= ZEBRA_PARTIAL_MAX_RATIO &&
+        avg_transitions >= ZEBRA_MIN_TRANSITIONS)
+    {
         return true;
     }
 
-    if (stripe_count >= 3) {
+    /*
+     * 判据二：当前摄像头视角下，斑马线有时只露出一条宽白带。
+     * 这时主要依靠 max_white_ratio 区分：
+     * - 普通白线接近 1.00；
+     * - 斑马线约 0.75。
+     */
+    if (stripe_count == 1 &&
+        max_white_ratio >= ZEBRA_PARTIAL_MIN_RATIO &&
+        max_white_ratio <= ZEBRA_PARTIAL_MAX_RATIO &&
+        avg_transitions >= ZEBRA_MIN_TRANSITIONS &&
+        max_stripe_height >= ZEBRA_MIN_BAND_HEIGHT)
+    {
         return true;
     }
 
@@ -230,11 +267,8 @@ static bool detectZebraCrossingLightweight(const cv::Mat& gray)
 
 /*
  * 检测普通白线。
- *
- * 注意：
- * 斑马线本身也是很多白线，所以调用时应当先判断斑马线。
  */
-static bool detectWhiteLineLightweight(const cv::Mat& gray)
+static bool detectWhiteLineLightweight(const cv::Mat& gray, ElementDebugInfo* debug_info = nullptr)
 {
     if (gray.empty()) {
         return false;
@@ -256,6 +290,7 @@ static bool detectWhiteLineLightweight(const cv::Mat& gray)
     int band_count = 0;
     bool in_band = false;
     int band_height = 0;
+    int max_band_height = 0;
 
     double max_white_ratio = 0.0;
 
@@ -263,10 +298,7 @@ static bool detectWhiteLineLightweight(const cv::Mat& gray)
         double ratio = whiteRatioOnRow(gray, y, x_start, x_end, 2);
         max_white_ratio = std::max(max_white_ratio, ratio);
 
-        /*
-         * 普通白线通常是一条横向较连续的白色区域。
-         */
-        bool row_is_white_band = ratio > 0.48;
+        bool row_is_white_band = ratio > 0.45;
 
         if (row_is_white_band) {
             if (!in_band) {
@@ -279,6 +311,7 @@ static bool detectWhiteLineLightweight(const cv::Mat& gray)
             if (in_band) {
                 if (band_height >= 1) {
                     band_count++;
+                    max_band_height = std::max(max_band_height, band_height);
                 }
 
                 in_band = false;
@@ -289,14 +322,20 @@ static bool detectWhiteLineLightweight(const cv::Mat& gray)
 
     if (in_band && band_height >= 1) {
         band_count++;
+        max_band_height = std::max(max_band_height, band_height);
+    }
+
+    if (debug_info != nullptr) {
+        debug_info->band_count = band_count;
+        debug_info->max_band_height = max_band_height;
+        debug_info->max_white_ratio = max_white_ratio;
     }
 
     /*
-     * 普通白线：
-     * - 至少有一段明显横向白色带；
-     * - 但不应该有太多条带，否则更像斑马线。
+     * 普通白线必须接近横贯 ROI。
+     * 根据你的数据，真实白线 wMaxRatio = 1.00，所以这里用 0.90 比较安全。
      */
-    if (band_count >= 1 && band_count <= 2 && max_white_ratio > 0.50) {
+    if (band_count >= 1 && band_count <= 2 && max_white_ratio >= WHITE_LINE_MIN_RATIO) {
         return true;
     }
 
@@ -305,12 +344,6 @@ static bool detectWhiteLineLightweight(const cv::Mat& gray)
 
 /*
  * 元素识别总入口。
- *
- * 关键点：
- * 1. 低频运行；
- * 2. 只读 raw_frame；
- * 3. 不修改寻迹相关 Mat 和全局变量；
- * 4. 只打印，不参与控制。
  */
 static void ElementDetectAndPrintLowRate(const cv::Mat& frame)
 {
@@ -321,9 +354,11 @@ static void ElementDetectAndPrintLowRate(const cv::Mat& frame)
     static int skip_counter = 0;
     static bool last_zebra_detected = false;
     static bool last_white_detected = false;
+    static int zebra_candidate_count = 0;
 
     static double last_zebra_print_time = -100.0;
     static double last_white_print_time = -100.0;
+    static double last_debug_print_time = -100.0;
 
     skip_counter++;
 
@@ -345,17 +380,44 @@ static void ElementDetectAndPrintLowRate(const cv::Mat& frame)
         gray = frame;
     }
 
-    bool zebra_detected = detectZebraCrossingLightweight(gray);
+    ElementDebugInfo zebra_debug;
+    ElementDebugInfo white_debug;
 
-    /*
-     * 斑马线优先级高。
-     * 如果当前已经是斑马线，就不要再报白线，
-     * 避免斑马线中的某一条白条被误认为普通白线。
-     */
+    bool zebra_candidate = detectZebraCrossingLightweight(gray, &zebra_debug);
+
+    if (zebra_candidate) {
+        zebra_candidate_count++;
+    } else {
+        zebra_candidate_count = 0;
+    }
+
+    bool zebra_detected = zebra_candidate_count >= ZEBRA_CONFIRM_FRAMES;
+
     bool white_detected = false;
 
-    if (!zebra_detected) {
-        white_detected = detectWhiteLineLightweight(gray);
+    /*
+     * 如果已经出现斑马线候选，即使还没有连续确认，也先不要报白线。
+     * 这样能避免斑马线进入画面的第一帧被误报为普通白线。
+     */
+    if (!zebra_candidate && !zebra_detected) {
+        white_detected = detectWhiteLineLightweight(gray, &white_debug);
+    }
+
+    if (ELEMENT_DEBUG_PRINT && now - last_debug_print_time >= 1.0) {
+        std::cout << std::fixed << std::setprecision(2)
+                  << "[元素调试] zebraCandidate=" << zebra_candidate
+                  << " zebra=" << zebra_detected
+                  << " zCnt=" << zebra_candidate_count
+                  << " stripe=" << zebra_debug.stripe_count
+                  << " trans=" << zebra_debug.avg_transitions
+                  << " zMaxRatio=" << zebra_debug.max_white_ratio
+                  << " zMaxHeight=" << zebra_debug.max_band_height
+                  << " | white=" << white_detected
+                  << " band=" << white_debug.band_count
+                  << " wMaxRatio=" << white_debug.max_white_ratio
+                  << " wMaxHeight=" << white_debug.max_band_height
+                  << std::endl;
+        last_debug_print_time = now;
     }
 
     bool zebra_rising_edge = zebra_detected && !last_zebra_detected;
