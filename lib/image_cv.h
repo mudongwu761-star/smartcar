@@ -29,3 +29,6 @@ extern int line_end;
 
 extern int yellowAreaCount;
 extern int RedAreaCount;
+
+/** 锥桶绕行偏置（向右为正）；仅当运行目录下文件 coneAvoid 内容为 1 时参与舵机，否则恒为 0，不扰动原有巡线。 */
+extern double cone_avoid_bias_pixels;
