@@ -64,6 +64,7 @@ bool range_mark = 0;
  * - 收窄斑马线的 partial-ratio 上限，减少普通亮斑/边缘误检；
  * - 增加斑马线连续确认帧数，过滤偶发误检点；
  * - 斑马线候选出现时，暂时不报白线，避免同一目标被重复分类。
+ * - 增加红灯/绿灯检测，只打印识别结果，不参与控制。
  */
 static constexpr int ELEMENT_WHITE_THRESHOLD = 180;
 static constexpr int ELEMENT_DETECT_INTERVAL = 3;
@@ -82,12 +83,33 @@ static constexpr double ZEBRA_MIN_TRANSITIONS = 1.80;
 static constexpr int ZEBRA_MIN_BAND_HEIGHT = 8;
 static constexpr int ZEBRA_CONFIRM_FRAMES = 2;            // 保持 2 帧确认；通过提高检测频率来提升稳定性
 
+/*
+ * 红绿灯识别参数。
+ *
+ * 当前赛道红绿灯不会同时出现。红灯效果稳定；绿灯用 HSV 与 BGR 交集，
+ * 避免蓝色、黄色赛道被算进绿色面积。
+ */
+static constexpr int TRAFFIC_LIGHT_CONFIRM_FRAMES = 1;
+static constexpr double TRAFFIC_LIGHT_MIN_AREA = 80.0;
+
+enum class TrafficLightState {
+    NONE = 0,
+    RED,
+    GREEN
+};
+
 struct ElementDebugInfo {
     double max_white_ratio = 0.0;
     double avg_transitions = 0.0;
     int stripe_count = 0;
     int band_count = 0;
     int max_band_height = 0;
+};
+
+struct TrafficLightDebugInfo {
+    double red_area = 0.0;
+    double green_area = 0.0;
+    double max_area = 0.0;
 };
 
 /*
@@ -343,6 +365,133 @@ static bool detectWhiteLineLightweight(const cv::Mat& gray, ElementDebugInfo* de
 }
 
 /*
+ * 计算颜色 mask 的有效像素面积。
+ */
+static double getTrafficLightMaskArea(const cv::Mat& mask)
+{
+    if (mask.empty()) {
+        return 0.0;
+    }
+
+    return static_cast<double>(cv::countNonZero(mask));
+}
+
+/*
+ * 轻量级红绿灯识别。
+ *
+ * 返回：
+ * - RED：红灯；
+ * - GREEN：绿灯；
+ * - NONE：未检测到有效红绿灯。
+ */
+static TrafficLightState detectTrafficLightLightweight(
+    const cv::Mat& frame,
+    TrafficLightDebugInfo* debug_info = nullptr
+)
+{
+    if (frame.empty()) {
+        return TrafficLightState::NONE;
+    }
+
+    cv::Mat bgr;
+
+    if (frame.channels() == 3) {
+        bgr = frame;
+    } else if (frame.channels() == 4) {
+        cv::cvtColor(frame, bgr, cv::COLOR_BGRA2BGR);
+    } else {
+        return TrafficLightState::NONE;
+    }
+
+    cv::Mat hsv;
+    cv::cvtColor(bgr, hsv, cv::COLOR_BGR2HSV);
+
+    cv::Mat red_mask1;
+    cv::Mat red_mask2;
+    cv::Mat red_mask;
+
+    cv::inRange(hsv, cv::Scalar(0, 70, 50), cv::Scalar(12, 255, 255), red_mask1);
+    cv::inRange(hsv, cv::Scalar(168, 70, 50), cv::Scalar(179, 255, 255), red_mask2);
+    red_mask = red_mask1 | red_mask2;
+
+    /*
+     * 绿色检测：
+     * 1. HSV 收窄到绿/青绿范围，避开赛道黄色和蓝色；
+     * 2. BGR 要求 G 明显强于 R，且不能明显弱于 B；
+     * 3. 二者取交集，避免蓝色/黄色赛道被算进绿色面积。
+     */
+    cv::Mat green_mask_hsv;
+    cv::Mat green_mask_bgr;
+    cv::Mat green_mask;
+
+    cv::inRange(hsv, cv::Scalar(45, 50, 45), cv::Scalar(95, 255, 255), green_mask_hsv);
+
+    cv::Mat bgr_channels[3];
+    cv::split(bgr, bgr_channels);
+
+    cv::Mat green_bright;
+    cv::Mat green_not_blue;
+    cv::Mat green_gt_r;
+    cv::Mat g_plus_blue_tolerance;
+    cv::Mat r_plus_margin;
+
+    cv::compare(bgr_channels[1], 70, green_bright, cv::CMP_GT);
+
+    cv::add(bgr_channels[1], cv::Scalar(12), g_plus_blue_tolerance);
+    cv::add(bgr_channels[2], cv::Scalar(25), r_plus_margin);
+
+    cv::compare(g_plus_blue_tolerance, bgr_channels[0], green_not_blue, cv::CMP_GT);
+    cv::compare(bgr_channels[1], r_plus_margin, green_gt_r, cv::CMP_GT);
+
+    green_mask_bgr = green_bright & green_not_blue & green_gt_r;
+    green_mask = green_mask_hsv & green_mask_bgr;
+
+    cv::Mat kernel3 = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(3, 3));
+    cv::Mat kernel5 = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(5, 5));
+
+    cv::morphologyEx(red_mask, red_mask, cv::MORPH_OPEN, kernel3);
+    cv::morphologyEx(red_mask, red_mask, cv::MORPH_CLOSE, kernel3);
+
+    cv::morphologyEx(green_mask, green_mask, cv::MORPH_OPEN, kernel3);
+    cv::morphologyEx(green_mask, green_mask, cv::MORPH_CLOSE, kernel5);
+
+    double red_area = getTrafficLightMaskArea(red_mask);
+    double green_area = getTrafficLightMaskArea(green_mask);
+    double max_area = std::max(red_area, green_area);
+
+    if (debug_info != nullptr) {
+        debug_info->red_area = red_area;
+        debug_info->green_area = green_area;
+        debug_info->max_area = max_area;
+    }
+
+    if (max_area < TRAFFIC_LIGHT_MIN_AREA) {
+        return TrafficLightState::NONE;
+    }
+
+    bool red_visible = red_area >= TRAFFIC_LIGHT_MIN_AREA;
+    bool green_visible = green_area >= TRAFFIC_LIGHT_MIN_AREA;
+
+    if (red_visible && !green_visible) {
+        return TrafficLightState::RED;
+    }
+
+    if (green_visible && !red_visible) {
+        return TrafficLightState::GREEN;
+    }
+
+    /*
+     * 实际赛道中红绿灯不会同时出现。这里处理的是阈值串扰：
+     * 两个 mask 都过阈值时，按有效面积更大的颜色播报。
+     */
+    if (red_area >= green_area) {
+        return TrafficLightState::RED;
+    }
+
+    return TrafficLightState::GREEN;
+}
+
+/*
  * 元素识别总入口。
  */
 static void ElementDetectAndPrintLowRate(const cv::Mat& frame)
@@ -356,8 +505,13 @@ static void ElementDetectAndPrintLowRate(const cv::Mat& frame)
     static bool last_white_detected = false;
     static int zebra_candidate_count = 0;
 
+    static TrafficLightState last_light_detected = TrafficLightState::NONE;
+    static TrafficLightState light_candidate_state = TrafficLightState::NONE;
+    static int light_candidate_count = 0;
+
     static double last_zebra_print_time = -100.0;
     static double last_white_print_time = -100.0;
+    static double last_light_print_time = -100.0;
     static double last_debug_print_time = -100.0;
 
     skip_counter++;
@@ -382,6 +536,7 @@ static void ElementDetectAndPrintLowRate(const cv::Mat& frame)
 
     ElementDebugInfo zebra_debug;
     ElementDebugInfo white_debug;
+    TrafficLightDebugInfo light_debug;
 
     bool zebra_candidate = detectZebraCrossingLightweight(gray, &zebra_debug);
 
@@ -403,6 +558,26 @@ static void ElementDetectAndPrintLowRate(const cv::Mat& frame)
         white_detected = detectWhiteLineLightweight(gray, &white_debug);
     }
 
+    TrafficLightState light_raw_state = detectTrafficLightLightweight(frame, &light_debug);
+
+    if (light_raw_state != TrafficLightState::NONE &&
+        light_raw_state == light_candidate_state)
+    {
+        light_candidate_count++;
+    } else if (light_raw_state != TrafficLightState::NONE) {
+        light_candidate_state = light_raw_state;
+        light_candidate_count = 1;
+    } else {
+        light_candidate_state = TrafficLightState::NONE;
+        light_candidate_count = 0;
+    }
+
+    TrafficLightState light_detected = TrafficLightState::NONE;
+
+    if (light_candidate_count >= TRAFFIC_LIGHT_CONFIRM_FRAMES) {
+        light_detected = light_candidate_state;
+    }
+
     if (ELEMENT_DEBUG_PRINT && now - last_debug_print_time >= 1.0) {
         std::cout << std::fixed << std::setprecision(2)
                   << "[元素调试] zebraCandidate=" << zebra_candidate
@@ -416,12 +591,19 @@ static void ElementDetectAndPrintLowRate(const cv::Mat& frame)
                   << " band=" << white_debug.band_count
                   << " wMaxRatio=" << white_debug.max_white_ratio
                   << " wMaxHeight=" << white_debug.max_band_height
+                  << " | lightRaw=" << static_cast<int>(light_raw_state)
+                  << " light=" << static_cast<int>(light_detected)
+                  << " lCnt=" << light_candidate_count
+                  << " redArea=" << light_debug.red_area
+                  << " greenArea=" << light_debug.green_area
                   << std::endl;
         last_debug_print_time = now;
     }
 
     bool zebra_rising_edge = zebra_detected && !last_zebra_detected;
     bool white_rising_edge = white_detected && !last_white_detected;
+    bool light_changed = light_detected != TrafficLightState::NONE &&
+                         light_detected != last_light_detected;
 
     if (zebra_rising_edge && now - last_zebra_print_time >= ELEMENT_PRINT_COOLDOWN_SEC) {
         std::cout << "[元素识别] 检测到斑马线" << std::endl;
@@ -433,8 +615,24 @@ static void ElementDetectAndPrintLowRate(const cv::Mat& frame)
         last_white_print_time = now;
     }
 
+    if (light_changed && now - last_light_print_time >= ELEMENT_PRINT_COOLDOWN_SEC) {
+        if (light_detected == TrafficLightState::RED) {
+            std::cout << "[交通灯识别] 检测到红灯" << std::endl;
+        } else if (light_detected == TrafficLightState::GREEN) {
+            std::cout << "[交通灯识别] 检测到绿灯" << std::endl;
+        }
+
+        last_light_print_time = now;
+    }
+
     last_zebra_detected = zebra_detected;
     last_white_detected = white_detected;
+
+    if (light_detected != TrafficLightState::NONE) {
+        last_light_detected = light_detected;
+    } else {
+        last_light_detected = TrafficLightState::NONE;
+    }
 }
 
 int CameraInit(uint8_t camera_id, double dest_fps, int width, int height)
