@@ -81,8 +81,8 @@ static constexpr bool ELEMENT_DEBUG_PRINT = false;
  */
 static constexpr double WHITE_LINE_MIN_RATIO = 0.90;
 static constexpr double ZEBRA_PARTIAL_MIN_RATIO = 0.50;
-static constexpr double ZEBRA_PARTIAL_MAX_RATIO = 0.8;   // 误检多时继续降到 0.82；漏检多时回到 0.88
-static constexpr double ZEBRA_MIN_TRANSITIONS = 2.5;     // 误检多时提高；漏检多时降回 1.80
+static constexpr double ZEBRA_PARTIAL_MAX_RATIO = 0.88;   // 误检多时继续降到 0.82；漏检多时回到 0.88
+static constexpr double ZEBRA_MIN_TRANSITIONS = 2.2;     // 误检多时提高；漏检多时降回 1.80
 static constexpr int ZEBRA_MIN_BAND_HEIGHT = 8;
 static constexpr int ZEBRA_CONFIRM_FRAMES = 2;            // 保持 2 帧确认；通过提高检测频率来提升稳定性
 
