@@ -5,6 +5,7 @@
 #include <string>
 #include "PwmController.h"
 #include "PIDController.h"
+#include "parking_module.h"
 
 const std::string kp_file = "./kp";
 const std::string ki_file = "./ki";
@@ -15,6 +16,8 @@ const std::string mortor_ki_file = "./mortor_ki";
 const std::string mortor_kd_file = "./mortor_kd";
 
 const std::string start_file = "./start";
+/** 非 1 时关闭视觉锥桶偏置，舵机与原先纯巡线一致；需要绕行时再 echo 1 > coneAvoid */
+const std::string cone_avoid_enable_file = "./coneAvoid";
 const std::string showImg_file = "./showImg";
 const std::string destfps_file = "./destfps";
 const std::string foresee_file = "./foresee";
@@ -28,11 +31,16 @@ const std::string speed_diff_k_file = "./speed_diff_k";
 extern int TURN_DURATION; // 0.3s / 0.008s ≈ 37.5，取38
 const std::string turn_duration_file = "./turn_duration";
 
+extern ParkingModule g_parking;
+
 // 从文件读取双精度值
 double readDoubleFromFile(const std::string& filename);
 
 // 从文件中读取标志
 bool readFlag(const std::string& filename);
+
+/** 文件不存在或无法打开时直接返回 false，不向 stderr 打日志（用于可选功能开关）。 */
+bool readFlagQuiet(const std::string& filename);
 
 extern std::atomic<double> PID_rotate;
 extern std::atomic<bool> pause_flag;   

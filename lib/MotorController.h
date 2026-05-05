@@ -24,6 +24,7 @@ public:
     void updateSpeed(void);
     void updateTarget(double speed);
     void updateduty(double dutyCycle);
+    double getLastEncoderRps() const;
     PIDController pidController;
 
     int encoder_dir;
@@ -33,6 +34,7 @@ private:
     PwmController pwmController;
 
     GPIO directionGPIO;
+    double last_encoder_rps;
 
 };
 

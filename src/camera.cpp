@@ -29,6 +29,8 @@
 #include "wonderEcho.h"
 #include "sign_classify.h"
 #include "encoder.h"
+#include "control.h"
+#include "parking_module.h"
 
 cv::VideoCapture cap;
 
@@ -81,10 +83,10 @@ static constexpr bool ELEMENT_DEBUG_PRINT = false;
  */
 static constexpr double WHITE_LINE_MIN_RATIO = 0.90;
 static constexpr double ZEBRA_PARTIAL_MIN_RATIO = 0.50;
-static constexpr double ZEBRA_PARTIAL_MAX_RATIO = 0.88;   // 误检多时继续降到 0.82；漏检多时回到 0.88
-static constexpr double ZEBRA_MIN_TRANSITIONS = 2.2;     // 误检多时提高；漏检多时降回 1.80
+static constexpr double ZEBRA_PARTIAL_MAX_RATIO = 0.88;
+static constexpr double ZEBRA_MIN_TRANSITIONS = 2.2;
 static constexpr int ZEBRA_MIN_BAND_HEIGHT = 8;
-static constexpr int ZEBRA_CONFIRM_FRAMES = 2;            // 保持 2 帧确认；通过提高检测频率来提升稳定性
+static constexpr int ZEBRA_CONFIRM_FRAMES = 2;
 
 /*
  * 红绿灯识别参数。
@@ -377,6 +379,262 @@ static bool detectWhiteLineLightweight(const cv::Mat& gray, ElementDebugInfo* de
 /*
  * 计算颜色 mask 的有效像素面积。
  */
+static int transitionCountOnColumn(const cv::Mat& gray, int x, int y_start, int y_end, int step)
+{
+    if (gray.empty() || x < 0 || x >= gray.cols || y_start >= y_end) {
+        return 0;
+    }
+
+    bool current_white = gray.at<uchar>(y_start, x) > ELEMENT_WHITE_THRESHOLD;
+    int transitions = 0;
+
+    for (int y = y_start + step; y < y_end; y += step) {
+        if (y < 0 || y >= gray.rows) {
+            continue;
+        }
+
+        bool pixel_white = gray.at<uchar>(y, x) > ELEMENT_WHITE_THRESHOLD;
+
+        if (pixel_white != current_white) {
+            transitions++;
+            current_white = pixel_white;
+        }
+    }
+
+    return transitions;
+}
+
+/*
+ * 检测斑马线候选。
+ *
+ * 注意：这里返回的是 candidate，不是最终输出结果。
+ * 最终输出还要在 ElementDetectAndPrintLowRate() 里做连续帧确认。
+ */
+static bool detectZebraCrossingLightweight(const cv::Mat& frame, ElementDebugInfo* debug_info = nullptr)
+{
+    if (frame.empty()) {
+        return false;
+    }
+
+    cv::Mat gray;
+    if (frame.channels() == 3) {
+        cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
+    } else if (frame.channels() == 4) {
+        cv::cvtColor(frame, gray, cv::COLOR_BGRA2GRAY);
+    } else {
+        gray = frame;
+    }
+
+    cv::Mat yellow_mask;
+    if (frame.channels() >= 3) {
+        cv::Mat hsv;
+        cv::cvtColor(frame, hsv, cv::COLOR_BGR2HSV);
+        cv::inRange(hsv, cv::Scalar(15, 50, 50), cv::Scalar(35, 255, 255), yellow_mask);
+    }
+
+    const int height = gray.rows;
+    const int width = gray.cols;
+
+    const int x_start = static_cast<int>(width * 0.12);
+    const int x_end = static_cast<int>(width * 0.88);
+
+    const int y_start = static_cast<int>(height * 0.10);
+    const int y_end = static_cast<int>(height * 0.90);
+
+    if (x_end <= x_start || y_end <= y_start) {
+        return false;
+    }
+
+    int total_transitions = 0;
+    int valid_columns = 0;
+
+    const int column_count = 9;
+
+    for (int i = 0; i < column_count; ++i) {
+        int x = x_start + (x_end - x_start) * i / std::max(1, column_count - 1);
+        int transitions = transitionCountOnColumn(gray, x, y_start, y_end, 3);
+
+        total_transitions += transitions;
+        valid_columns++;
+    }
+
+    double avg_transitions = 0.0;
+    if (valid_columns > 0) {
+        avg_transitions = static_cast<double>(total_transitions) / static_cast<double>(valid_columns);
+    }
+
+    int stripe_count = 0;
+    bool in_stripe = false;
+    int stripe_height = 0;
+    int max_stripe_height = 0;
+    double max_white_ratio = 0.0;
+    int total_band_rows = 0;
+    int total_row_count = 0;
+
+    for (int y = y_start; y < y_end; y += 2) {
+        double ratio = whiteRatioOnRow(gray, yellow_mask, y, x_start, x_end, 2);
+        max_white_ratio = std::max(max_white_ratio, ratio);
+        total_row_count++;
+
+        bool row_is_white_band = ratio > 0.30;
+
+        if (row_is_white_band) {
+            if (!in_stripe) {
+                in_stripe = true;
+                stripe_height = 1;
+            } else {
+                stripe_height++;
+            }
+            total_band_rows++;
+        } else {
+            if (in_stripe) {
+                if (stripe_height >= 1) {
+                    stripe_count++;
+                    max_stripe_height = std::max(max_stripe_height, stripe_height);
+                }
+
+                in_stripe = false;
+                stripe_height = 0;
+            }
+        }
+    }
+
+    if (in_stripe && stripe_height >= 1) {
+        stripe_count++;
+        max_stripe_height = std::max(max_stripe_height, stripe_height);
+    }
+
+    double band_density = total_row_count > 0 ? static_cast<double>(total_band_rows) / total_row_count : 0.0;
+
+    if (debug_info != nullptr) {
+        debug_info->avg_transitions = avg_transitions;
+        debug_info->stripe_count = stripe_count;
+        debug_info->max_white_ratio = max_white_ratio;
+        debug_info->max_band_height = max_stripe_height;
+    }
+
+    /*
+     * 判据一：典型斑马线，多横条且密度大。
+     * 斑马线白条总比例高(>0.65)、垂直跳变多(>2.8)、密度大(>0.25)。
+     */
+    if (stripe_count >= 3 &&
+        max_white_ratio >= 0.65 &&
+        max_white_ratio <= ZEBRA_PARTIAL_MAX_RATIO &&
+        avg_transitions >= 2.8 &&
+        band_density >= 0.25 && band_density <= 0.75)
+    {
+        return true;
+    }
+
+    /*
+     * 判据二：斑马线有时只露出一条宽白带。
+     */
+    if (stripe_count == 1 &&
+        max_white_ratio >= 0.65 &&
+        max_white_ratio <= ZEBRA_PARTIAL_MAX_RATIO &&
+        avg_transitions >= 2.8 &&
+        max_stripe_height >= ZEBRA_MIN_BAND_HEIGHT &&
+        band_density >= 0.20)
+    {
+        return true;
+    }
+
+    /*
+     * 判据二：斑马线有时只露出一条宽白带。
+     */
+    if (stripe_count == 1 &&
+        max_white_ratio >= 0.55 &&
+        max_white_ratio <= ZEBRA_PARTIAL_MAX_RATIO &&
+        avg_transitions >= 2.5 &&
+        max_stripe_height >= ZEBRA_MIN_BAND_HEIGHT &&
+        band_density >= 0.15)
+    {
+        return true;
+    }
+
+    return false;
+}
+
+/*
+ * 检测普通白线。
+ */
+static bool detectWhiteLineLightweight(const cv::Mat& gray, ElementDebugInfo* debug_info = nullptr)
+{
+    if (gray.empty()) {
+        return false;
+    }
+
+    const int height = gray.rows;
+    const int width = gray.cols;
+
+    const int x_start = static_cast<int>(width * 0.12);
+    const int x_end = static_cast<int>(width * 0.88);
+
+    const int y_start = static_cast<int>(height * 0.45);
+    const int y_end = static_cast<int>(height * 0.90);
+
+    if (x_end <= x_start || y_end <= y_start) {
+        return false;
+    }
+
+    int band_count = 0;
+    bool in_band = false;
+    int band_height = 0;
+    int max_band_height = 0;
+
+    double max_white_ratio = 0.0;
+
+    for (int y = y_start; y < y_end; y += 2) {
+        double ratio = whiteRatioOnRow(gray, cv::Mat(), y, x_start, x_end, 2);
+        max_white_ratio = std::max(max_white_ratio, ratio);
+
+        bool row_is_white_band = ratio > 0.45;
+
+        if (row_is_white_band) {
+            if (!in_band) {
+                in_band = true;
+                band_height = 1;
+            } else {
+                band_height++;
+            }
+        } else {
+            if (in_band) {
+                if (band_height >= 1) {
+                    band_count++;
+                    max_band_height = std::max(max_band_height, band_height);
+                }
+
+                in_band = false;
+                band_height = 0;
+            }
+        }
+    }
+
+    if (in_band && band_height >= 1) {
+        band_count++;
+        max_band_height = std::max(max_band_height, band_height);
+    }
+
+    if (debug_info != nullptr) {
+        debug_info->band_count = band_count;
+        debug_info->max_band_height = max_band_height;
+        debug_info->max_white_ratio = max_white_ratio;
+    }
+
+    /*
+     * 普通白线必须接近横贯 ROI。
+     * 根据你的数据，真实白线 wMaxRatio = 1.00，所以这里用 0.90 比较安全。
+     */
+    if (band_count >= 1 && band_count <= 2 && max_white_ratio >= WHITE_LINE_MIN_RATIO) {
+        return true;
+    }
+
+    return false;
+}
+
+/*
+ * 计算颜色 mask 的有效像素面积。
+ */
 static double getTrafficLightMaskArea(const cv::Mat& mask)
 {
     if (mask.empty()) {
@@ -539,6 +797,7 @@ static void ElementDetectAndPrintLowRate(const cv::Mat& frame)
     static bool last_zebra_detected = false;
     static bool last_white_detected = false;
     static int zebra_candidate_count = 0;
+    static bool last_zebra_candidate_notified = false;
 
     static TrafficLightState last_light_detected = TrafficLightState::NONE;
     static TrafficLightState light_candidate_state = TrafficLightState::NONE;
@@ -573,7 +832,7 @@ static void ElementDetectAndPrintLowRate(const cv::Mat& frame)
     ElementDebugInfo white_debug;
     TrafficLightDebugInfo light_debug;
 
-    bool zebra_candidate = detectZebraCrossingLightweight(gray, &zebra_debug);
+    bool zebra_candidate = detectZebraCrossingLightweight(frame, &zebra_debug);
 
     if (zebra_candidate) {
         zebra_candidate_count++;
@@ -640,21 +899,39 @@ static void ElementDetectAndPrintLowRate(const cv::Mat& frame)
     bool light_changed = light_detected != TrafficLightState::NONE &&
                          light_detected != last_light_detected;
 
+    /*
+     * 斑马线第一次出现候选帧就提前通知停车（类似红绿灯逻辑），
+     * 不等确认帧，这样停车更及时。
+     * notifyZebraCrossing 内部有 is_stopped_ 保护，不会重复触发。
+     */
+    bool zebra_candidate_rising = zebra_candidate && !last_zebra_candidate_notified;
+    if (zebra_candidate_rising) {
+        g_parking.notifyZebraCrossing();
+    }
+    last_zebra_candidate_notified = zebra_candidate;
+
+    /*
+     * 确认帧输出日志，不再重复触发停车。
+     */
     if (zebra_rising_edge && now - last_zebra_print_time >= ELEMENT_PRINT_COOLDOWN_SEC) {
-        std::cout << "[元素识别] 检测到斑马线" << std::endl;
+        std::cout << "[元素识别] 斑马线确认" << std::endl;
         last_zebra_print_time = now;
     }
 
     if (white_rising_edge && now - last_white_print_time >= ELEMENT_PRINT_COOLDOWN_SEC) {
         std::cout << "[元素识别] 检测到白线" << std::endl;
         last_white_print_time = now;
+        g_parking.notifyWhiteLine();
+        ResetTraveledDistance();
     }
 
     if (light_changed && now - last_light_print_time >= ELEMENT_PRINT_COOLDOWN_SEC) {
         if (light_detected == TrafficLightState::RED) {
             std::cout << "[交通灯识别] 检测到红灯" << std::endl;
+            g_parking.notifyTrafficLight(TrafficLightStatus::RED);
         } else if (light_detected == TrafficLightState::GREEN) {
             std::cout << "[交通灯识别] 检测到绿灯" << std::endl;
+            g_parking.notifyTrafficLight(TrafficLightStatus::GREEN);
         }
 
         last_light_print_time = now;
@@ -869,6 +1146,7 @@ int CameraInit(uint8_t camera_id, double dest_fps, int width, int height)
     line_tracking_width = newWidth / calc_scale;
     line_tracking_height = newHeight / calc_scale;
 
+    // 启动异步元素检测线程
     StartElementDetectionWorker();
 
     // 计算每帧的延迟时间 ms
@@ -877,6 +1155,7 @@ int CameraInit(uint8_t camera_id, double dest_fps, int width, int height)
 
 void cameraDeInit(void)
 {
+    // 停止异步元素检测线程
     StopElementDetectionWorker();
 
     cap.release();
@@ -1058,6 +1337,11 @@ int CameraHandler(void)
      * 丢掉旧帧，避免阻塞下一次中线和舵机误差更新。
      */
     SubmitElementDetectionFrame(raw_frame);
+
+    /*
+     * 四、斑马线停车状态机更新。
+     */
+    g_parking.update();
 
     // 保存图像
     if (readFlag(saveImg_file)) {

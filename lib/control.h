@@ -7,6 +7,7 @@ void ControlInit();
 void ControlMain();
 void ControlPause();
 void ControlExit();
+void ResetTraveledDistance();
 
 extern double mortor_kp;
 extern double mortor_ki;

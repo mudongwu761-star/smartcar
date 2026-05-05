@@ -11,6 +11,8 @@
 #include <fstream>
 #include <iostream>
 
+ParkingModule g_parking;
+
 double target_speed;
 int servo_mid;
 std::atomic<bool> pause_flag(false);  
@@ -27,7 +29,6 @@ bool trigger4_fired = false;
 bool trigger5_fired = false;
 bool trigger6_fired = false;
 bool trigger7_fired = false;
-// ...existing code...
 
 // 从文件读取双精度值
 double readDoubleFromFile(const std::string& filename)
@@ -55,6 +56,17 @@ bool readFlag(const std::string& filename)
         std::cerr << "Failed to open " << filename << std::endl;
     }
     return flag;
+}
+
+bool readFlagQuiet(const std::string& filename)
+{
+    std::ifstream file(filename);
+    int flag = 0;
+    if (!file.is_open()) {
+        return false;
+    }
+    file >> flag;
+    return flag != 0;
 }
 
 double speed_diff_k = 0.0005; // 默认差速系数

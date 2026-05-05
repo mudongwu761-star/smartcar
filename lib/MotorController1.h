@@ -24,6 +24,7 @@ public:
     void updateSpeed1(void);
     void updateTarget1(double speed);
     void updateduty1(double dutyCycle);
+    double getLastEncoderRps1() const;
     PIDController pidController1;
 
     ENCODER encoder1;
@@ -33,6 +34,7 @@ private:
     PwmController pwmController1;
     
     GPIO directionGPIO1;
+    double last_encoder_rps1;
 };
 
 #endif // MOTOR_CONTROLLER_H

@@ -4,7 +4,7 @@
  * @LastEditors: ilikara 3435193369@qq.com
  * @LastEditTime: 2025-04-05 09:08:57
  * @FilePath: /smartcar/src/MotorController.cpp
- * @Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
+ * @Description: 杩欐槸榛樿璁剧疆,璇疯缃甡customMade`, 鎵撳紑koroFileHeader鏌ョ湅閰嶇疆 杩涜璁剧疆: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
  */
 #include "MotorController1.h"
 
@@ -19,10 +19,11 @@ MotorController1::MotorController1(int pwmchip, int pwmnum, int gpioNum, unsigne
     , encoder1(encoder_pwmNum, encoder_gpioNum)
     , directionGPIO1(gpioNum)
     , encoder_dir1(encoder_dir_)
+    , last_encoder_rps1(0.0)
 {
-    pwmController1.setPeriod(period_ns); // 设置 PWM 周期
+    pwmController1.setPeriod(period_ns); // 璁剧疆 PWM 鍛ㄦ湡
     directionGPIO1.setDirection("out");
-    pwmController1.enable(); // 启用 PWM
+    pwmController1.enable(); // 鍚敤 PWM
 }
 
 MotorController1::~MotorController1(void)
@@ -37,11 +38,11 @@ void MotorController1::updateduty1(double dutyCycle)
         pwmController1.setDutyCycle(newduty);
     }
 
-    // 根据 PID 输出设置 GPIO 的方向
+    // 鏍规嵁 PID 杈撳嚭璁剧疆 GPIO 鐨勬柟鍚?    if (dutyCycle > 0) {
     if (dutyCycle > 0) {
-        directionGPIO1.setValue(1); // 正向
+        directionGPIO1.setValue(1); // 姝ｅ悜
     } else {
-        directionGPIO1.setValue(0); // 反向
+        directionGPIO1.setValue(0); // 鍙嶅悜
     }
     // std::cout << encoder.pulse_counter_update() << std::endl;
 }
@@ -49,34 +50,38 @@ void MotorController1::updateduty1(double dutyCycle)
 void MotorController1::updateSpeed1(void)
 {
     double encoderReading = encoder1.pulse_counter_update() * encoder_dir1;
+    last_encoder_rps1 = encoderReading;
     double output = pidController1.update(encoderReading);
 
-    // 设置 PWM 占空比
+    // 璁剧疆 PWM 鍗犵┖姣?    updateduty1(output);
     updateduty1(output);
     
-    // 添加时间控制，每0.5秒显示一次
+    // 娣诲姞鏃堕棿鎺у埗锛屾瘡0.5绉掓樉绀轰竴娆?    static auto last_print_time = std::chrono::steady_clock::now();
     static auto last_print_time = std::chrono::steady_clock::now();
     auto current_time = std::chrono::steady_clock::now();
     auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         current_time - last_print_time).count();
     
-    if (elapsed_ms >= 500) { // 500毫秒 = 0.5秒
-        // 获取PID三个分量值
-        double p_term = pidController1.getPTerm();
+    if (elapsed_ms >= 500) { // 500姣 = 0.5绉?        // 鑾峰彇PID涓変釜鍒嗛噺鍊?        double p_term = pidController1.getPTerm();
         double i_term = pidController1.getITerm();
         double d_term = pidController1.getDTerm();
         
      /*  std::cout << "RIGHT:" << encoderReading 
-                  << " | 目标:" << pidController1.getTarget()
-                  << " | P项:" << p_term 
-                  << " | I项:" << i_term 
-                  << " | D项:" << d_term
-                  << " | 输出:" << output << std::endl;*/
+                  << " | 鐩爣:" << pidController1.getTarget()
+                  << " | P椤?" << p_term 
+                  << " | I椤?" << i_term 
+                  << " | D椤?" << d_term
+                  << " | 杈撳嚭:" << output << std::endl;*/
                   
-        last_print_time = current_time;  // 更新上次打印时间
+        last_print_time = current_time;  // 鏇存柊涓婃鎵撳嵃鏃堕棿
     }
 }
 void MotorController1::updateTarget1(double speed)
 {
     pidController1.setTarget(speed);
+}
+
+double MotorController1::getLastEncoderRps1() const
+{
+    return last_encoder_rps1;
 }
