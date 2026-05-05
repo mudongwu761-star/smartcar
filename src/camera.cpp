@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -67,7 +68,8 @@ bool range_mark = 0;
  * - 增加红灯/绿灯检测，只打印识别结果，不参与控制。
  */
 static constexpr int ELEMENT_WHITE_THRESHOLD = 180;
-static constexpr int ELEMENT_DETECT_INTERVAL = 3;
+static constexpr int ELEMENT_DETECT_INTERVAL = 1;
+static constexpr int ELEMENT_ASYNC_MAX_WIDTH = 160;
 static constexpr double ELEMENT_PRINT_COOLDOWN_SEC = 1.5;
 static constexpr bool ELEMENT_DEBUG_PRINT = true;
 
@@ -90,7 +92,7 @@ static constexpr int ZEBRA_CONFIRM_FRAMES = 2;            // 保持 2 帧确认�
  * 避免蓝色、黄色赛道被算进绿色面积。
  */
 static constexpr int TRAFFIC_LIGHT_CONFIRM_FRAMES = 1;
-static constexpr double TRAFFIC_LIGHT_MIN_AREA = 80.0;
+static constexpr double TRAFFIC_LIGHT_MIN_AREA = 20.0;
 
 enum class TrafficLightState {
     NONE = 0,
@@ -111,6 +113,13 @@ struct TrafficLightDebugInfo {
     double green_area = 0.0;
     double max_area = 0.0;
 };
+
+static std::mutex element_frame_mutex;
+static std::condition_variable element_frame_cv;
+static cv::Mat element_latest_frame;
+static bool element_frame_ready = false;
+static bool element_worker_running = false;
+static std::thread element_worker_thread;
 
 /*
  * 统计某一行中的白色像素比例。
@@ -635,6 +644,105 @@ static void ElementDetectAndPrintLowRate(const cv::Mat& frame)
     }
 }
 
+static cv::Mat resizeElementFrame(const cv::Mat& frame)
+{
+    if (frame.empty() || frame.cols <= ELEMENT_ASYNC_MAX_WIDTH) {
+        return frame;
+    }
+
+    double scale = static_cast<double>(ELEMENT_ASYNC_MAX_WIDTH) / static_cast<double>(frame.cols);
+    int resized_height = std::max(1, static_cast<int>(frame.rows * scale));
+
+    cv::Mat resized;
+    cv::resize(frame, resized, cv::Size(ELEMENT_ASYNC_MAX_WIDTH, resized_height));
+    return resized;
+}
+
+static void ElementDetectionWorker()
+{
+    while (true) {
+        cv::Mat frame;
+
+        {
+            std::unique_lock<std::mutex> lock(element_frame_mutex);
+            element_frame_cv.wait(lock, [] {
+                return element_frame_ready || !element_worker_running;
+            });
+
+            if (!element_worker_running && !element_frame_ready) {
+                break;
+            }
+
+            frame = std::move(element_latest_frame);
+            element_latest_frame.release();
+            element_frame_ready = false;
+        }
+
+        if (frame.empty()) {
+            continue;
+        }
+
+        ElementDetectAndPrintLowRate(resizeElementFrame(frame));
+    }
+}
+
+static void StartElementDetectionWorker()
+{
+    {
+        std::lock_guard<std::mutex> lock(element_frame_mutex);
+
+        if (element_worker_running) {
+            return;
+        }
+
+        element_frame_ready = false;
+        element_latest_frame.release();
+        element_worker_running = true;
+    }
+
+    element_worker_thread = std::thread(ElementDetectionWorker);
+}
+
+static void StopElementDetectionWorker()
+{
+    {
+        std::lock_guard<std::mutex> lock(element_frame_mutex);
+        element_worker_running = false;
+        element_frame_ready = false;
+        element_latest_frame.release();
+    }
+
+    element_frame_cv.notify_one();
+
+    if (element_worker_thread.joinable()) {
+        element_worker_thread.join();
+    }
+}
+
+static void SubmitElementDetectionFrame(const cv::Mat& frame)
+{
+    if (frame.empty()) {
+        return;
+    }
+
+    {
+        std::unique_lock<std::mutex> lock(element_frame_mutex, std::try_to_lock);
+
+        if (!lock.owns_lock()) {
+            return;
+        }
+
+        if (!element_worker_running) {
+            return;
+        }
+
+        element_latest_frame = frame;
+        element_frame_ready = true;
+    }
+
+    element_frame_cv.notify_one();
+}
+
 int CameraInit(uint8_t camera_id, double dest_fps, int width, int height)
 {
     servo.setPeriod(3000000);
@@ -723,12 +831,16 @@ int CameraInit(uint8_t camera_id, double dest_fps, int width, int height)
     line_tracking_width = newWidth / calc_scale;
     line_tracking_height = newHeight / calc_scale;
 
+    StartElementDetectionWorker();
+
     // 计算每帧的延迟时间 ms
     return static_cast<int>(1000.0 / std::min(fps, dest_fps));
 }
 
 void cameraDeInit(void)
 {
+    StopElementDetectionWorker();
+
     cap.release();
 
     // 获取帧缓冲区设备信息
@@ -902,14 +1014,12 @@ int CameraHandler(void)
     }
 
     /*
-     * 三、低频元素识别。
+     * 三、异步元素识别。
      *
-     * 注意：
-     * 1. 放在 servo_error_temp 更新之后；
-     * 2. 每 ELEMENT_DETECT_INTERVAL 帧才检测一次；
-     * 3. 只打印，不控制小车。
+     * 这里只投递最新帧，不等待识别完成。元素识别线程来不及处理时会自动
+     * 丢掉旧帧，避免阻塞下一次中线和舵机误差更新。
      */
-    ElementDetectAndPrintLowRate(raw_frame);
+    SubmitElementDetectionFrame(raw_frame);
 
     // 保存图像
     if (readFlag(saveImg_file)) {
