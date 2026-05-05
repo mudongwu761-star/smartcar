@@ -70,8 +70,9 @@ bool range_mark = 0;
 static constexpr int ELEMENT_WHITE_THRESHOLD = 180;
 static constexpr int ELEMENT_DETECT_INTERVAL = 1;
 static constexpr int ELEMENT_ASYNC_MAX_WIDTH = 160;
+static constexpr int ELEMENT_ASYNC_MIN_INTERVAL_MS = 80;
 static constexpr double ELEMENT_PRINT_COOLDOWN_SEC = 1.5;
-static constexpr bool ELEMENT_DEBUG_PRINT = true;
+static constexpr bool ELEMENT_DEBUG_PRINT = false;
 
 /*
  * 根据你的实测数据：
@@ -80,8 +81,8 @@ static constexpr bool ELEMENT_DEBUG_PRINT = true;
  */
 static constexpr double WHITE_LINE_MIN_RATIO = 0.90;
 static constexpr double ZEBRA_PARTIAL_MIN_RATIO = 0.50;
-static constexpr double ZEBRA_PARTIAL_MAX_RATIO = 0.88;   // 斑马线检测不稳定时先放宽上限；若误检增多再降到 0.84/0.82
-static constexpr double ZEBRA_MIN_TRANSITIONS = 1.80;
+static constexpr double ZEBRA_PARTIAL_MAX_RATIO = 0.8;   // 误检多时继续降到 0.82；漏检多时回到 0.88
+static constexpr double ZEBRA_MIN_TRANSITIONS = 2.5;     // 误检多时提高；漏检多时降回 1.80
 static constexpr int ZEBRA_MIN_BAND_HEIGHT = 8;
 static constexpr int ZEBRA_CONFIRM_FRAMES = 2;            // 保持 2 帧确认；通过提高检测频率来提升稳定性
 
@@ -415,13 +416,41 @@ static TrafficLightState detectTrafficLightLightweight(
     cv::Mat hsv;
     cv::cvtColor(bgr, hsv, cv::COLOR_BGR2HSV);
 
+    cv::Mat bgr_channels[3];
+    cv::split(bgr, bgr_channels);
+
+    /*
+     * 红色检测：
+     * 1. HSV 检测红色相；
+     * 2. BGR 要求 R 通道明显强于 G/B；
+     * 3. 二者取交集，避免黄色、橙色、暗噪声被算进红灯面积。
+     */
     cv::Mat red_mask1;
     cv::Mat red_mask2;
+    cv::Mat red_mask_hsv;
+    cv::Mat red_mask_bgr;
     cv::Mat red_mask;
 
     cv::inRange(hsv, cv::Scalar(0, 70, 50), cv::Scalar(12, 255, 255), red_mask1);
     cv::inRange(hsv, cv::Scalar(168, 70, 50), cv::Scalar(179, 255, 255), red_mask2);
-    red_mask = red_mask1 | red_mask2;
+    red_mask_hsv = red_mask1 | red_mask2;
+
+    cv::Mat red_bright;
+    cv::Mat red_gt_g;
+    cv::Mat red_gt_b;
+    cv::Mat g_plus_red_margin;
+    cv::Mat b_plus_red_margin;
+
+    cv::compare(bgr_channels[2], 90, red_bright, cv::CMP_GT);
+
+    cv::add(bgr_channels[1], cv::Scalar(40), g_plus_red_margin);
+    cv::add(bgr_channels[0], cv::Scalar(35), b_plus_red_margin);
+
+    cv::compare(bgr_channels[2], g_plus_red_margin, red_gt_g, cv::CMP_GT);
+    cv::compare(bgr_channels[2], b_plus_red_margin, red_gt_b, cv::CMP_GT);
+
+    red_mask_bgr = red_bright & red_gt_g & red_gt_b;
+    red_mask = red_mask_hsv & red_mask_bgr;
 
     /*
      * 绿色检测：
@@ -434,9 +463,6 @@ static TrafficLightState detectTrafficLightLightweight(
     cv::Mat green_mask;
 
     cv::inRange(hsv, cv::Scalar(45, 50, 45), cv::Scalar(95, 255, 255), green_mask_hsv);
-
-    cv::Mat bgr_channels[3];
-    cv::split(bgr, bgr_channels);
 
     cv::Mat green_bright;
     cv::Mat green_not_blue;
@@ -660,6 +686,9 @@ static cv::Mat resizeElementFrame(const cv::Mat& frame)
 
 static void ElementDetectionWorker()
 {
+    using clock = std::chrono::steady_clock;
+    auto next_allowed_time = clock::now();
+
     while (true) {
         cv::Mat frame;
 
@@ -681,6 +710,13 @@ static void ElementDetectionWorker()
         if (frame.empty()) {
             continue;
         }
+
+        auto now = clock::now();
+        if (now < next_allowed_time) {
+            continue;
+        }
+
+        next_allowed_time = now + std::chrono::milliseconds(ELEMENT_ASYNC_MIN_INTERVAL_MS);
 
         ElementDetectAndPrintLowRate(resizeElementFrame(frame));
     }
@@ -745,6 +781,8 @@ static void SubmitElementDetectionFrame(const cv::Mat& frame)
 
 int CameraInit(uint8_t camera_id, double dest_fps, int width, int height)
 {
+    cv::setNumThreads(1);
+
     servo.setPeriod(3000000);
     servo.setDutyCycle(servo_mid);
     servo.enable();
