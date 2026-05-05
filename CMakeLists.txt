@@ -48,6 +48,7 @@ target_sources(common_lib PRIVATE ${COMMON_SOURCES})
 set(SUBDIRS
     main  
     demo1
+    wonderEcho_demo
 )
 
 foreach(subdir ${SUBDIRS})
